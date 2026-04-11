@@ -1,0 +1,5 @@
+{
+  "name": "AI-Powered API Security Gateway",
+  "description": "A lightweight API Gateway with firewall, rate limiting, and AI-based threat detection using Gemini.",
+  "requestFramePermissions": []
+}
