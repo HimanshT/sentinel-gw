@@ -67,27 +67,16 @@ export default function App() {
   const [testResult, setTestResult] = useState<any>(null);
   const [isTesting, setIsTesting] = useState(false);
 
-  const wsRef = useRef<WebSocket | null>(null);
-
   useEffect(() => {
     fetchConfig();
     fetchLogs();
     fetchStats();
+    const interval = setInterval(() => {
+      fetchLogs();
+      fetchStats();
+    }, 5000);
 
-    // Setup WebSocket
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${protocol}//${window.location.host}`);
-    wsRef.current = ws;
-
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      if (data.type === "NEW_LOG") {
-        setLogs(prev => [data.log, ...prev].slice(0, 100));
-        fetchStats();
-      }
-    };
-
-    return () => ws.close();
+    return () => clearInterval(interval);
   }, []);
 
   const fetchConfig = async () => {
@@ -99,7 +88,7 @@ export default function App() {
   const fetchLogs = async () => {
     const res = await fetch("/api/logs");
     const data = await res.json();
-    setLogs(data);
+    setLogs(data.slice(0, 100));
   };
 
   const fetchStats = async () => {
@@ -126,8 +115,26 @@ export default function App() {
     setIsTesting(true);
     setTestResult(null);
     try {
-      const res = await fetch(testUrl);
-      const data = await res.json();
+      const backendEnvironment = (import.meta as any).env?.VITE_BACKEND_URL;
+      const backendBase = config?.backendUrl || backendEnvironment || `${window.location.protocol}//${window.location.hostname}:8000`;
+      const normalizedBackendBase = backendBase.replace(/\/+$/, "");
+      let requestUrl: string;
+
+      if (testUrl.startsWith("/proxy")) {
+        requestUrl = `${normalizedBackendBase}${testUrl.replace(/^\/proxy/, "/test")}`;
+      } else if (testUrl.startsWith("/test")) {
+        requestUrl = `${normalizedBackendBase}${testUrl}`;
+      } else {
+        requestUrl = new URL(testUrl, window.location.origin).href;
+      }
+      const res = await fetch(requestUrl);
+      const text = await res.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = text;
+      }
       setTestResult({ status: res.status, data });
     } catch (err: any) {
       setTestResult({ status: "Error", data: err.message });
@@ -323,7 +330,7 @@ export default function App() {
                           value={testUrl}
                           onChange={(e) => setTestUrl(e.target.value)}
                           className="w-full bg-white/5 border border-white/10 rounded-xl py-2.5 pl-12 pr-4 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50 transition-all font-mono text-white"
-                          placeholder="/proxy/your-endpoint"
+                          placeholder="/proxy/your-endpoint or http://localhost:8000/test/your-endpoint"
                         />
                       </div>
                       <button 
