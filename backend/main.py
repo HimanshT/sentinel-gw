@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, HTTPException, Response
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 from starlette.routing import Match
@@ -7,9 +7,11 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from uuid import uuid4
 from backend.models.settings import GatewaySettings
+from backend.store import RedisStore
 
 
 app = FastAPI()
+store = RedisStore()
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,25 +41,9 @@ valid_paths = {
 malicious_signatures = ["or 1=1", "--", "<script>", "union select", "drop table", "exec("]
 
 
-# Loggin Entries
 LOG_FILE = Path(__file__).resolve().parents[1] / "logs" / "traffic_logs.json"
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-
-# Load and save the settings
-CONFIG_PATH = Path(__file__).resolve().parent / "config" / "gw_settings.conf"
-
-def load_settings() -> GatewaySettings:
-    if CONFIG_PATH.exists() and CONFIG_PATH.stat().st_size > 0:
-        return GatewaySettings.parse_raw(CONFIG_PATH.read_text(encoding="utf-8"))
-    return GatewaySettings()
-
-def save_settings(settings: GatewaySettings):
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(settings.model_dump_json(indent=2, by_alias=True), encoding="utf-8")
-
-# load the settings
-settings = load_settings()
 rate_counters : dict[str,tuple[datetime,int]]={}
 
 def append_traffic_log(entry: dict):
@@ -74,12 +60,14 @@ def append_traffic_log(entry: dict):
 
     data.append(entry)
 
-    # Keep the file bounded to the most recent 100 entries.
     if len(data) > 100:
         data = data[-100:]
 
     with LOG_FILE.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+    if entry.get("blocked") or entry.get("status") == "blocked":
+        store.append_threat(entry)
 
 
 
@@ -128,15 +116,35 @@ def api_stats():
 
 @app.get("/api/config")
 def api_get_config():
-    return settings.model_dump(by_alias=True)
+    return store.get_settings().model_dump(by_alias=True, mode="json")
 
 
 @app.post("/api/config")
 def api_update_config(new_settings: GatewaySettings):
-    global settings
-    settings = new_settings
-    save_settings(settings)
-    return settings.model_dump(by_alias=True)
+    return store.save_settings(new_settings).model_dump(by_alias=True, mode="json")
+
+
+@app.delete("/api/config")
+def api_delete_config():
+    return store.delete_settings().model_dump(by_alias=True, mode="json")
+
+
+@app.get("/api/threats")
+def api_threats():
+    return store.get_threats(100)
+
+
+@app.delete("/api/threats")
+def api_clear_threats():
+    store.clear_threats()
+    return {"status": "ok"}
+
+
+@app.delete("/api/threats/{threat_id}")
+def api_delete_threat(threat_id: str):
+    if not store.delete_threat(threat_id):
+        raise HTTPException(status_code=404, detail="Threat not found")
+    return {"status": "ok"}
 
 
 @app.middleware("http")
@@ -147,6 +155,7 @@ async def gateway_middleware(request:Request,call_next):
         return await call_next(request)
 
     metrics.total_requests += 1
+    settings = store.get_settings()
 
     # Check if any router route matches the incoming request
     body = await request.body()
@@ -207,6 +216,10 @@ async def gateway_middleware(request:Request,call_next):
 
     if count > settings.rate_limit_per_minute:
         metrics.blocked_threats += 1
+        log_entry["blocked"] = True
+        log_entry["status"] = "blocked"
+        log_entry["reason"] = "Rate limit exceeded"
+        append_traffic_log(log_entry)
         return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
 
     if any(sig in request.url.query.lower() or sig in body_text.lower() for sig in malicious_signatures):
@@ -249,12 +262,9 @@ async def test_route(path: str, request: Request):
 # settings AI
 @app.get("/gateway/settings")
 async def get_gateway_settings():
-    return settings.dict()
+    return store.get_settings().model_dump(by_alias=True, mode="json")
 
 @app.post("/gateway/settings")
 async def update_gateway_settings(new_settings:GatewaySettings):
-    global settings
-    settings = new_settings
-    save_settings(settings)
+    store.save_settings(new_settings)
     return {"status":"ok"}
-
