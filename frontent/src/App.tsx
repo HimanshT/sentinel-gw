@@ -115,15 +115,16 @@ export default function App() {
     setIsTesting(true);
     setTestResult(null);
     try {
-      const backendEnvironment = (import.meta as any).env?.VITE_BACKEND_URL;
-      const backendBase = config?.backendUrl || backendEnvironment || `${window.location.protocol}//${window.location.hostname}:8000`;
-      const normalizedBackendBase = backendBase.replace(/\/+$/, "");
+      const gatewayBase = `${window.location.protocol}//${window.location.hostname}:8000`;
+      const normalizedGatewayBase = gatewayBase.replace(/\/+$/, "");
       let requestUrl: string;
 
       if (testUrl.startsWith("/proxy")) {
-        requestUrl = `${normalizedBackendBase}${testUrl.replace(/^\/proxy/, "/test")}`;
+        requestUrl = `${normalizedGatewayBase}${testUrl.replace(/^\/proxy/, "") || "/"}`;
       } else if (testUrl.startsWith("/test")) {
-        requestUrl = `${normalizedBackendBase}${testUrl}`;
+        requestUrl = `${normalizedGatewayBase}${testUrl}`;
+      } else if (testUrl.startsWith("/gateway")) {
+        requestUrl = `${normalizedGatewayBase}${testUrl}`;
       } else {
         requestUrl = new URL(testUrl, window.location.origin).href;
       }
@@ -330,7 +331,7 @@ export default function App() {
                           value={testUrl}
                           onChange={(e) => setTestUrl(e.target.value)}
                           className="w-full bg-white/5 border border-white/10 rounded-xl py-2.5 pl-12 pr-4 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50 transition-all font-mono text-white"
-                          placeholder="/proxy/your-endpoint or http://localhost:8000/test/your-endpoint"
+                          placeholder="/proxy/your-upstream-path or http://localhost:8000/your-upstream-path"
                         />
                       </div>
                       <button 
@@ -536,7 +537,7 @@ export default function App() {
 
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                     <div className="space-y-2">
-                      <label className="text-xs font-semibold text-white/40 uppercase tracking-wider">Backend Target URL</label>
+                      <label className="text-xs font-semibold text-white/40 uppercase tracking-wider">Upstream Target URL</label>
                       <input 
                         type="text" 
                         value={config.backendUrl}
@@ -569,7 +570,11 @@ export default function App() {
                       </div>
                     </div>
                     <button 
-                      onClick={() => setConfig({...config, aiEnabled: !config.aiEnabled})}
+                      onClick={() => {
+                        const nextConfig = {...config, aiEnabled: !config.aiEnabled};
+                        setConfig(nextConfig);
+                        saveConfig(nextConfig);
+                      }}
                       className={cn(
                         "w-12 h-6 rounded-full relative transition-all duration-300 cursor-pointer",
                         config.aiEnabled ? "bg-blue-600" : "bg-white/10"

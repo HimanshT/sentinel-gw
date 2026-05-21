@@ -27,7 +27,7 @@ export default defineConfig(({mode}) => {
           changeOrigin: true,
           secure: false,
           ws: true,
-          rewrite: (path) => path.replace(/^\/proxy/, '/test'),
+          rewrite: (path) => path.replace(/^\/proxy/, '') || '/',
         },
       },
       // HMR is disabled in AI Studio via DISABLE_HMR env var.

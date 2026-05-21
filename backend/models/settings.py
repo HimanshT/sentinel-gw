@@ -2,7 +2,7 @@ from pydantic import BaseModel, AnyHttpUrl, Field
 
 class GatewaySettings(BaseModel):
     backend_url: AnyHttpUrl = Field(
-        "http://localhost:8000",
+        "https://httpbin.org",
         alias="backendUrl",
         validate_default=True,
     )

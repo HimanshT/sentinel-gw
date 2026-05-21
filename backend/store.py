@@ -8,8 +8,12 @@ from backend.models.settings import GatewaySettings
 
 class RedisStore:
     SETTINGS_KEY = "sentinel:gateway:settings"
+    METRICS_KEY = "sentinel:gateway:metrics"
+    RATE_LIMIT_PREFIX = "sentinel:gateway:rate_limit"
+    TRAFFIC_LOGS_STREAM = "sentinel:gateway:traffic_logs"
     THREATS_KEY = "sentinel:gateway:threats"
     MAX_LOG_ENTRIES = 100
+    METRIC_FIELDS = ("total", "allowed", "blocked")
 
     def __init__(self):
         try:
@@ -41,6 +45,80 @@ class RedisStore:
         settings = GatewaySettings()
         self.save_settings(settings)
         return settings
+
+    def get_metrics(self) -> dict[str, int]:
+        raw_metrics = self.client.hgetall(self.METRICS_KEY)
+        return {
+            field: int(raw_metrics.get(field, 0))
+            for field in self.METRIC_FIELDS
+        }
+
+    def increment_metrics(
+        self,
+        total: int = 0,
+        allowed: int = 0,
+        blocked: int = 0,
+    ) -> dict[str, int]:
+        increments = {
+            "total": total,
+            "allowed": allowed,
+            "blocked": blocked,
+        }
+
+        pipeline = self.client.pipeline()
+        for field, amount in increments.items():
+            if amount:
+                pipeline.hincrby(self.METRICS_KEY, field, amount)
+        pipeline.execute()
+
+        return self.get_metrics()
+
+    def increment_rate_limit(self, identifier: str, window_seconds: int = 60) -> tuple[int, int]:
+        key = f"{self.RATE_LIMIT_PREFIX}:{identifier}"
+        count = self.client.incr(key)
+        if count == 1:
+            self.client.expire(key, window_seconds)
+
+        ttl = self.client.ttl(key)
+        return count, max(ttl, 0)
+
+    def append_traffic_log(self, entry: dict) -> None:
+        normalized_entry = self._normalize_entry(entry)
+        self.client.xadd(
+            self.TRAFFIC_LOGS_STREAM,
+            {"entry": json.dumps(normalized_entry)},
+            maxlen=self.MAX_LOG_ENTRIES,
+            approximate=True,
+        )
+
+        if normalized_entry["status"] == "blocked":
+            self.append_threat(normalized_entry)
+
+    def get_traffic_logs(self, limit: int = MAX_LOG_ENTRIES) -> list[dict]:
+        entries = []
+        stream_entries = self.client.xrevrange(
+            self.TRAFFIC_LOGS_STREAM,
+            max="+",
+            min="-",
+            count=limit,
+        )
+
+        for stream_id, fields in stream_entries:
+            raw_entry = fields.get("entry")
+            if not raw_entry:
+                continue
+
+            try:
+                decoded = json.loads(raw_entry)
+            except json.JSONDecodeError:
+                continue
+
+            if isinstance(decoded, dict):
+                entry = self._normalize_entry(decoded)
+                entry["streamId"] = stream_id
+                entries.append(entry)
+
+        return entries
 
     def append_threat(self, entry: dict) -> None:
         normalized_entry = self._normalize_entry(entry)
@@ -100,4 +178,6 @@ class RedisStore:
             "reason": entry.get("reason") or entry.get("Reason") or "N/A",
             "aiScore": entry.get("aiScore") if entry.get("aiScore") is not None else 0,
             "aiCategory": entry.get("aiCategory") or entry.get("AI analysis") or "Clean",
+            "aiReason": entry.get("aiReason") or "",
+            "aiCached": bool(entry.get("aiCached", False)),
         }

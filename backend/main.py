@@ -1,11 +1,10 @@
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import JSONResponse
-from starlette.routing import Match
-import json
-from pathlib import Path
-from datetime import datetime, timedelta
+from starlette.responses import JSONResponse, Response
+from datetime import datetime
 from uuid import uuid4
+import httpx
+from backend.ai_threat import analyze_unknown_threat
 from backend.models.settings import GatewaySettings
 from backend.store import RedisStore
 
@@ -22,82 +21,79 @@ app.add_middleware(
 )
 
 
-class GatewayMetrics:
-    def __init__(self):
-        self.total_requests = 0
-        self.allowed_traffic = 0
-        self.blocked_threats = 0
-
-
-metrics = GatewayMetrics()
-
-valid_paths = {
-    "/" : ["GET"],
-    "/stats" : ["GET"],
-    "/test/{path:path}" : ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-}
-
-
 malicious_signatures = ["or 1=1", "--", "<script>", "union select", "drop table", "exec("]
+HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+}
+RESPONSE_HEADERS_TO_DROP = HOP_BY_HOP_HEADERS | {"content-length", "server", "date"}
 
 
-LOG_FILE = Path(__file__).resolve().parents[1] / "logs" / "traffic_logs.json"
-LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+def contains_malicious_signature(*values) -> bool:
+    haystack_parts = []
+    for value in values:
+        if isinstance(value, dict):
+            haystack_parts.extend(str(item) for pair in value.items() for item in pair)
+        elif value is not None:
+            haystack_parts.append(str(value))
 
-rate_counters : dict[str,tuple[datetime,int]]={}
+    haystack = " ".join(haystack_parts).lower()
+    return any(signature in haystack for signature in malicious_signatures)
+
 
 def append_traffic_log(entry: dict):
-    LOG_FILE.touch(exist_ok=True)
+    if entry.get("blocked"):
+        entry["status"] = "blocked"
+    elif entry.get("status") not in {"allowed", "blocked"}:
+        entry["status"] = "allowed"
 
-    if LOG_FILE.stat().st_size == 0:
-        data = []
-    else:
-        with LOG_FILE.open("r", encoding="utf-8") as f:
-            try:
-                data = json.load(f)
-            except json.JSONDecodeError:
-                data = []
-
-    data.append(entry)
-
-    if len(data) > 100:
-        data = data[-100:]
-
-    with LOG_FILE.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-    if entry.get("blocked") or entry.get("status") == "blocked":
-        store.append_threat(entry)
+    store.append_traffic_log(entry)
 
 
 
 def load_traffic_logs(limit: int = 100):
-    if not LOG_FILE.exists() or LOG_FILE.stat().st_size == 0:
-        return []
+    return store.get_traffic_logs(limit)
 
-    try:
-        data = json.loads(LOG_FILE.read_text(encoding="utf-8") or "[]")
-        if isinstance(data, list):
-            entries = list(reversed(data[-limit:]))
-            normalized = []
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    continue
-                normalized.append({
-                    "id": entry.get("id") or entry.get("timestamp") or uuid4().hex,
-                    "timestamp": entry.get("timestamp"),
-                    "ip": entry.get("ip") or entry.get("ip address") or "unknown",
-                    "method": entry.get("method"),
-                    "path": entry.get("path"),
-                    "status": entry.get("status"),
-                    "reason": entry.get("reason") or entry.get("Reason") or "N/A",
-                    "aiScore": entry.get("aiScore") if entry.get("aiScore") is not None else 0,
-                    "aiCategory": entry.get("aiCategory") or entry.get("AI analysis") or "Clean",
-                })
-            return normalized
-    except json.JSONDecodeError:
-        pass
-    return []
+
+def build_upstream_url(request: Request, settings: GatewaySettings) -> str:
+    base_url = str(settings.backend_url).rstrip("/")
+    path = request.url.path
+    query = f"?{request.url.query}" if request.url.query else ""
+    return f"{base_url}{path}{query}"
+
+
+def proxy_request_headers(request: Request, upstream_host: str) -> dict:
+    headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in HOP_BY_HOP_HEADERS and key.lower() != "host"
+    }
+    headers["host"] = upstream_host
+    headers["x-forwarded-host"] = request.headers.get("host", "")
+    headers["x-forwarded-proto"] = request.url.scheme
+    headers["x-forwarded-for"] = request.client.host if request.client else ""
+    return headers
+
+
+def proxy_response_headers(headers) -> dict:
+    return {
+        key: value
+        for key, value in headers.items()
+        if key.lower() not in RESPONSE_HEADERS_TO_DROP
+    }
+
+
+def points_to_gateway(upstream_url: str) -> bool:
+    parsed_url = httpx.URL(upstream_url)
+    host = parsed_url.host or ""
+    port = parsed_url.port or (443 if parsed_url.scheme == "https" else 80)
+    return host in {"localhost", "127.0.0.1", "0.0.0.0", "backend"} and port == 8000
 
 
 @app.get("/api/logs")
@@ -107,11 +103,7 @@ def api_logs():
 
 @app.get("/api/stats")
 def api_stats():
-    return {
-        "total": metrics.total_requests,
-        "blocked": metrics.blocked_threats,
-        "allowed": metrics.allowed_traffic,
-    }
+    return store.get_metrics()
 
 
 @app.get("/api/config")
@@ -147,109 +139,13 @@ def api_delete_threat(threat_id: str):
     return {"status": "ok"}
 
 
-@app.middleware("http")
-async def gateway_middleware(request:Request,call_next):
-    # Do not count frontend admin/API polling or settings endpoints as gateway traffic.
-    internal_prefixes = ("/api", "/stats", "/gateway")
-    if request.url.path.startswith(internal_prefixes):
-        return await call_next(request)
-
-    metrics.total_requests += 1
-    settings = store.get_settings()
-
-    # Check if any router route matches the incoming request
-    body = await request.body()
-    body_text = body.decode("utf-8","ignore")
-
-    route_exists = any(
-        route.matches(request.scope)[0]==Match.FULL
-        for route in app.router.routes
-    )
-
-    client_ip = request.client.host
-    log_entry = {
-        "id": uuid4().hex,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "method": request.method,
-        "path": request.url.path,
-        "query": dict(request.query_params),
-        "body": body_text,
-        "route_exists": route_exists,
-        "malicious": False,
-        "ip": client_ip,
-        "aiScore": 0,
-        "aiCategory": "Clean",
-        "reason": "Passed Security Checks",
-        "status":"allowed"
-    }
-    
-    if not route_exists:
-        metrics.blocked_threats +=1
-        log_entry["blocked"] = True
-        log_entry["reason"] = "route_not_found"
-        append_traffic_log(log_entry)
-        return JSONResponse({"detail": "Route not found"}, status_code=404)
-    
-    now = datetime.utcnow()
-
-    if client_ip in settings.blocked_ips:
-        metrics.blocked_threats += 1
-        log_entry["blocked"] = True
-        log_entry["reason"] = "Blocked IP"
-        append_traffic_log(log_entry)
-        return JSONResponse({"detail": "Blocked IP"}, status_code=403)
-    
-    if settings.whitelisted_ips and client_ip not in settings.whitelisted_ips:
-        metrics.blocked_threats += 1
-        log_entry["blocked"] = True
-        log_entry["reason"] = "Non whitelisted IP"
-        append_traffic_log(log_entry)
-        return JSONResponse({"detail": "IP not whitelisted"}, status_code=403)
-    
-
-    # handle rate limiting
-    window_start,count = rate_counters.get(client_ip,(now,0))
-    if now-window_start >= timedelta(minutes=1):
-        window_start,count = now,0
-    count +=1
-    rate_counters[client_ip] = (window_start,count)
-
-    if count > settings.rate_limit_per_minute:
-        metrics.blocked_threats += 1
-        log_entry["blocked"] = True
-        log_entry["status"] = "blocked"
-        log_entry["reason"] = "Rate limit exceeded"
-        append_traffic_log(log_entry)
-        return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
-
-    if any(sig in request.url.query.lower() or sig in body_text.lower() for sig in malicious_signatures):
-        metrics.blocked_threats +=1
-        log_entry["blocked"] = True
-        log_entry["reason"] = "malicious_payload"
-        append_traffic_log(log_entry)
-        return JSONResponse({"detail": "Blocked: malicious payload detected"}, status_code=403)
-
-    
-    metrics.allowed_traffic += 1
-    log_entry["blocked"] = False
-    append_traffic_log(log_entry)
-    return await call_next(request)
-
-
-@app.get("/")
-async def root():
+@app.get("/gateway/health")
+async def gateway_health():
     return {"message": "Gateway is alive"}
 
-@app.get("/stats")
-async def get_stats():
-    return {
-        "total_requests": metrics.total_requests,
-        "allowed_traffic": metrics.allowed_traffic,
-        "blocked_threats": metrics.blocked_threats,
-    }
 
-@app.api_route("/test/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
-async def test_route(path: str, request: Request):
+@app.api_route("/gateway/echo/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+async def gateway_echo(path: str, request: Request):
     return {
         "status": "ok",
         "path": path,
@@ -259,7 +155,117 @@ async def test_route(path: str, request: Request):
     }
 
 
-# settings AI
+@app.middleware("http")
+async def gateway_middleware(request:Request,call_next):
+    # Do not count frontend admin/API polling or settings endpoints as gateway traffic.
+    internal_prefixes = ("/api", "/stats", "/gateway")
+    if request.url.path.startswith(internal_prefixes):
+        return await call_next(request)
+
+    settings = store.get_settings()
+
+    body = await request.body()
+    body_text = body.decode("utf-8","ignore")
+
+    client_ip = request.client.host
+    log_entry = {
+        "id": uuid4().hex,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "method": request.method,
+        "path": request.url.path,
+        "query": dict(request.query_params),
+        "body": body_text,
+        "upstreamUrl": build_upstream_url(request, settings),
+        "malicious": False,
+        "ip": client_ip,
+        "aiScore": 0,
+        "aiCategory": "Clean",
+        "aiReason": "AI threat detection did not run",
+        "aiCached": False,
+        "reason": "Passed Security Checks",
+        "status":"allowed"
+    }
+
+    if client_ip in settings.blocked_ips:
+        store.increment_metrics(total=1, blocked=1)
+        log_entry["blocked"] = True
+        log_entry["aiScore"] = 1
+        log_entry["aiCategory"] = "Blocked IP"
+        log_entry["aiReason"] = "Client IP matched the configured blocked IP list"
+        log_entry["reason"] = "Blocked IP"
+        append_traffic_log(log_entry)
+        return JSONResponse({"detail": "Blocked IP"}, status_code=403)
+    
+    if settings.whitelisted_ips and client_ip not in settings.whitelisted_ips:
+        store.increment_metrics(total=1, blocked=1)
+        log_entry["blocked"] = True
+        log_entry["aiScore"] = 0.8
+        log_entry["aiCategory"] = "Non Whitelisted IP"
+        log_entry["aiReason"] = "Client IP was not present in the configured whitelist"
+        log_entry["reason"] = "Non whitelisted IP"
+        append_traffic_log(log_entry)
+        return JSONResponse({"detail": "IP not whitelisted"}, status_code=403)
+    
+
+    count, retry_after = store.increment_rate_limit(client_ip)
+
+    if count > settings.rate_limit_per_minute:
+        store.increment_metrics(total=1, blocked=1)
+        log_entry["blocked"] = True
+        log_entry["status"] = "blocked"
+        log_entry["aiScore"] = 0.7
+        log_entry["aiCategory"] = "Rate Limit"
+        log_entry["aiReason"] = "Client exceeded the configured request rate"
+        log_entry["reason"] = "Rate limit exceeded"
+        append_traffic_log(log_entry)
+        return JSONResponse(
+            {"detail": "Rate limit exceeded", "retryAfter": retry_after},
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    if contains_malicious_signature(request.url.query, dict(request.query_params), body_text):
+        store.increment_metrics(total=1, blocked=1)
+        log_entry["blocked"] = True
+        log_entry["aiScore"] = 1
+        log_entry["aiCategory"] = "Known Signature"
+        log_entry["aiReason"] = "Request matched a configured malicious payload signature"
+        log_entry["reason"] = "malicious_payload"
+        append_traffic_log(log_entry)
+        return JSONResponse({"detail": "Blocked: malicious payload detected"}, status_code=403)
+
+    if settings.ai_threat_detection:
+        ai_analysis = analyze_unknown_threat(log_entry)
+        log_entry.update(ai_analysis)
+
+        if log_entry["aiScore"] >= settings.ai_threshold:
+            store.increment_metrics(total=1, blocked=1)
+            log_entry["blocked"] = True
+            log_entry["status"] = "blocked"
+            log_entry["reason"] = log_entry.get("aiReason") or "AI threat threshold exceeded"
+            append_traffic_log(log_entry)
+            return JSONResponse({
+                "detail": "Blocked: AI threat detected",
+                "aiScore": log_entry["aiScore"],
+                "aiCategory": log_entry["aiCategory"],
+            }, status_code=403)
+
+    
+    store.increment_metrics(total=1, allowed=1)
+    log_entry["blocked"] = False
+    append_traffic_log(log_entry)
+    return await call_next(request)
+
+
+@app.get("/stats")
+async def get_stats():
+    metrics = store.get_metrics()
+    return {
+        "total_requests": metrics["total"],
+        "allowed_traffic": metrics["allowed"],
+        "blocked_threats": metrics["blocked"],
+    }
+
 @app.get("/gateway/settings")
 async def get_gateway_settings():
     return store.get_settings().model_dump(by_alias=True, mode="json")
@@ -268,3 +274,43 @@ async def get_gateway_settings():
 async def update_gateway_settings(new_settings:GatewaySettings):
     store.save_settings(new_settings)
     return {"status":"ok"}
+
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+async def reverse_proxy(path: str, request: Request):
+    settings = store.get_settings()
+    upstream_url = build_upstream_url(request, settings)
+
+    if points_to_gateway(upstream_url):
+        return JSONResponse(
+            {
+                "detail": "Reverse proxy target points back to this gateway. "
+                "Set backendUrl to the upstream app you want to protect."
+            },
+            status_code=502,
+        )
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=20) as client:
+            upstream_response = await client.request(
+                method=request.method,
+                url=upstream_url,
+                headers=proxy_request_headers(request, httpx.URL(upstream_url).host),
+                content=await request.body(),
+            )
+    except httpx.RequestError as exc:
+        return JSONResponse(
+            {
+                "detail": "Upstream request failed",
+                "upstreamUrl": upstream_url,
+                "error": str(exc),
+            },
+            status_code=502,
+        )
+
+    return Response(
+        content=upstream_response.content,
+        status_code=upstream_response.status_code,
+        headers=proxy_response_headers(upstream_response.headers),
+        media_type=upstream_response.headers.get("content-type"),
+    )
